@@ -7,42 +7,10 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <MQTT.h>
+#include <esp_task_wdt.h>
 
-// Configuration structure for better organization
-struct Config {
-    // Network settings
-    static constexpr const char* HOSTNAME = "ESP32-DAC";
-    static constexpr const char* WIFI_SSID = "ssidname";
-    static constexpr const char* WIFI_PASSWORD = "wifipassword";
-    static constexpr const char* OTA_PASSWORD = "otapassword";
-    static constexpr const char* MQTT_SERVER = "192.168.88.44";
-    static constexpr const char* MQTT_USER = "someuser";
-    static constexpr const char* MQTT_PASSWORD = "somepassword";
-    
-    // MQTT topics
-    static constexpr const char* TOPIC_VOLUME_SET = "/tele/esp-dac/volume/set";
-    static constexpr const char* TOPIC_VOLUME_STATE = "/tele/esp-dac/volume";
-    static constexpr const char* TOPIC_DISPLAY_SET = "/tele/esp-dac/display/set";
-    
-    // Hardware pins
-    static constexpr uint8_t IR_RECEIVE_PIN = 36;
-    static constexpr uint8_t DAC_SS_PIN = 5;
-    
-    // Display settings
-    static constexpr unsigned long SCREEN_TIMEOUT = 3000;
-    
-    // Volume settings
-    static constexpr float TWICE_LOUD_STEPS = 20.0f;
-    static constexpr float TWICE_LOUD_DB = 10.0f;
-};
-
-// IR codes in an enum class for type safety
-enum class IRCommand : uint32_t {
-    UP_SONY = 0x00004BA5,
-    DOWN_SONY = 0x00004BA4,
-    UP_APPLE = 0xDCC8CD06,    // rolling code note
-    DOWN_APPLE = 0x671A1C02   // rolling code note
-};
+// Include Configuration
+#include "esp32-config.h"
 
 // Global state structure
 struct State {
@@ -54,6 +22,14 @@ struct State {
     unsigned long lastIRTime = 0;
     String displayText;
     bool hasDisplayMessage = false;
+    volatile bool displayBusy = false;
+    bool displayUpdatePending = false;
+    
+    enum DisplayMode {
+        VOLUME,
+        MINIMAL,
+        TEXT
+    } currentMode = VOLUME;
     
     void resetScreen() {
         screenTimeOn = millis();
@@ -70,9 +46,8 @@ State state;
 
 // Function prototypes
 void updateVolume();
-void updateDisplay();
-void clearDisplay();
-void updateTextDisplay();
+void requestDisplayUpdate();
+void handleDisplayUpdate();
 void sendVolumeMQTT();
 
 class WiFiManager {
@@ -144,7 +119,7 @@ void messageReceived(String &topic, String &payload) {
             state.volume = static_cast<byte>(tempVolume);
             state.resetScreen();
             updateVolume();
-            updateDisplay();
+            requestDisplayUpdate();
             sendVolumeMQTT();
         }
     }
@@ -152,9 +127,11 @@ void messageReceived(String &topic, String &payload) {
         state.displayText = payload;
         state.hasDisplayMessage = !payload.isEmpty();
         if (state.hasDisplayMessage) {
-            updateTextDisplay();  // Immediately show the message
+            state.currentMode = State::DisplayMode::TEXT;
+            requestDisplayUpdate();
         } else {
-            clearDisplay();
+            state.currentMode = State::DisplayMode::MINIMAL;
+            requestDisplayUpdate();
         }
     }
 }
@@ -192,6 +169,8 @@ void updateVolume() {
     int dacValue = min(255, static_cast<int>(Config::TWICE_LOUD_STEPS / Config::TWICE_LOUD_DB * state.volume + 0.5f));
     dacVolume.analogWrite(0, dacValue);
     Serial.printf("Volume: %d, DAC Value: %d\n", state.volume, dacValue);
+    state.currentMode = State::DisplayMode::VOLUME;
+    requestDisplayUpdate();
 }
 
 void handleIRCommand() {
@@ -229,16 +208,84 @@ void handleIRCommand() {
     if (volumeChanged) {
         state.resetScreen();
         updateVolume();
-        updateDisplay();
+        requestDisplayUpdate();
         sendVolumeMQTT();
     }
 
     IrReceiver.resume();
 }
 
+void requestDisplayUpdate() {
+    state.displayUpdatePending = true;
+}
+
+void handleDisplayUpdate() {
+    static uint8_t errorCount = 0;
+    if (state.displayBusy) {
+        errorCount++;
+        if (errorCount > 10) {  // If display stays busy for too long
+            state.displayBusy = false;
+            errorCount = 0;
+        }
+        return;
+    }
+    
+    if (!state.displayUpdatePending) {
+        return;
+    }
+    
+    errorCount = 0;
+    state.displayBusy = true;
+    
+    u8g2.clearBuffer();
+    
+    static char buffer[12];
+    switch (state.currentMode) {
+        case State::DisplayMode::VOLUME:
+            u8g2.setFont(u8g2_font_logisoso18_tf);
+            u8g2.drawStr(0, 18, "VOL");
+            
+            u8g2.setFont(u8g2_font_logisoso58_tf);
+            sprintf(buffer, "-%2d", state.volume);
+            u8g2.drawStr(0, 61, buffer);
+            u8g2.drawStr(130, 61, "dB");
+            break;
+            
+        case State::DisplayMode::MINIMAL:
+            u8g2.setFont(u8g2_font_logisoso18_tf);
+            sprintf(buffer, "VOL -%2d dB", state.volume);
+            u8g2.drawStr(0, 18, buffer);
+            break;
+            
+        case State::DisplayMode::TEXT:
+            u8g2.setFont(u8g2_font_logisoso18_tf);
+            u8g2.drawStr(0, 32, state.displayText.c_str());
+            break;
+    }
+    
+    // Always draw WiFi bars
+    for (int b = 0; b <= state.wifiSignalBars; b++) {
+        u8g2.drawBox(228 + (b*5), 64 - (b*5), 3, b*5);
+    }
+    
+    u8g2.sendBuffer();
+    state.displayBusy = false;
+    state.displayUpdatePending = false;
+    state.screenTimeOn = millis();
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Booting ESP32 DAC Controller");
+
+    // Initialize watchdog
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 8000,              // 8 seconds
+        .idle_core_mask = (1 << 0),      // Watch core 0
+        .trigger_panic = true            // Trigger panic on timeout
+    };
+    esp_task_wdt_init(&wdt_config);
+    esp_task_wdt_add(NULL);
 
     if (!WiFiManager::connect()) {
         ESP.restart();
@@ -264,21 +311,21 @@ void setup() {
     delay(1000);
 
     state.wifiSignalBars = WiFiManager::getBarsSignal(WiFi.RSSI());
-    updateDisplay();
+    requestDisplayUpdate();
     setupMQTT();
     sendVolumeMQTT();
 }
 
 void loop() {
+    esp_task_wdt_reset();
+
     if ((millis() - state.screenTimeOn > Config::SCREEN_TIMEOUT) && state.screenOn) {
-        if (state.hasDisplayMessage) {
-            updateTextDisplay();
-        } else {
-            clearDisplay();
-        }
         state.screenOn = false;
+        state.currentMode = state.hasDisplayMessage ? State::DisplayMode::TEXT : State::DisplayMode::MINIMAL;
+        requestDisplayUpdate();
     }
 
+    handleDisplayUpdate();
     handleIRCommand();
     handleMQTT();
     ArduinoOTA.handle();
@@ -287,57 +334,7 @@ void loop() {
     static unsigned long lastWifiCheck = 0;
     if (millis() - lastWifiCheck > 60000) {  // Check every 60 seconds
         state.wifiSignalBars = WiFiManager::getBarsSignal(WiFi.RSSI());
+        requestDisplayUpdate();
         lastWifiCheck = millis();
     }
-}
-
-void updateDisplay() {
-    u8g2.clearBuffer();
-    
-    u8g2.setFont(u8g2_font_logisoso18_tf);
-    u8g2.drawStr(0, 18, "VOL");
-    
-    u8g2.setFont(u8g2_font_logisoso58_tf);
-    char buffer[10];
-    sprintf(buffer, "-%2d", state.volume);
-    u8g2.drawStr(0, 61, buffer);
-    u8g2.drawStr(130, 61, "dB");
-
-    // Draw WiFi signal strength bars
-    for (int b = 0; b <= state.wifiSignalBars; b++) {
-        u8g2.drawBox(228 + (b*5), 64 - (b*5), 3, b*5);
-    }
-    
-    u8g2.sendBuffer();
-    state.screenTimeOn = millis();
-}
-
-void clearDisplay() {
-    u8g2.clearBuffer();
-    
-    u8g2.setFont(u8g2_font_logisoso18_tf);
-    char buffer[12];
-    sprintf(buffer, "VOL -%2d dB", state.volume);
-    u8g2.drawStr(0, 18, buffer);
-
-    // Draw WiFi signal strength bars
-    for (int b = 0; b <= state.wifiSignalBars; b++) {
-        u8g2.drawBox(228 + (b*5), 64 - (b*5), 3, b*5);
-    }
-    
-    u8g2.sendBuffer();
-}
-
-void updateTextDisplay() {
-    u8g2.clearBuffer();
-    
-    u8g2.setFont(u8g2_font_logisoso18_tf);
-    u8g2.drawStr(0, 32, state.displayText.c_str());
-    
-    // Draw WiFi signal strength bars
-    for (int b = 0; b <= state.wifiSignalBars; b++) {
-        u8g2.drawBox(228 + (b*5), 64 - (b*5), 3, b*5);
-    }
-    
-    u8g2.sendBuffer();
 }
