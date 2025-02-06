@@ -21,20 +21,59 @@ struct State {
     uint32_t lastIRCode = 0;
     unsigned long lastIRTime = 0;
     String displayText;
-    bool hasDisplayMessage = false;
     volatile bool displayBusy = false;
     bool displayUpdatePending = false;
+    String moodeSource;
+    String moodeDetails;
     
+    bool hasMoodeInfo() const {
+        return !moodeSource.isEmpty();
+    }
+
+    bool hasDisplayMessage() const {
+        return !displayText.isEmpty();
+    }
+
     enum DisplayMode {
         VOLUME,
         MINIMAL,
-        TEXT
+        TEXT,
+        MOODE
     } currentMode = VOLUME;
     
+    enum InputSource {
+        OPTICAL,
+        COAX,
+        I2S
+    } currentSource = I2S;
+
     void resetScreen() {
         screenTimeOn = millis();
         screenOn = true;
     }
+
+    String inputSourceToString() {
+        switch(currentSource) {
+            case OPTICAL:   return Config::DISPLAY_OPTICAL_TEXT;
+            case COAX:      return Config::DISPLAY_COAX_TEXT;
+            case I2S:       return Config::DISPLAY_I2S_TEXT;
+            default:        return "";
+        }
+    }
+
+    InputSource stringToInputSource(const String &s) {
+        if (s.equalsIgnoreCase(Config::DISPLAY_OPTICAL_TEXT)) {
+            return InputSource::OPTICAL;
+        } else if (s.equalsIgnoreCase(Config::DISPLAY_COAX_TEXT)) {
+            return InputSource::COAX;
+        } else if (s.equalsIgnoreCase(Config::DISPLAY_I2S_TEXT)) {
+            return InputSource::I2S;
+        } else {
+            // A default value if no match is found.
+            return InputSource::I2S;
+        }
+}
+
 };
 
 // Global objects
@@ -45,6 +84,7 @@ MQTTClient mqttClient;
 State state;
 
 // Function prototypes
+void handleVolumeChange();
 void updateVolume();
 void requestDisplayUpdate();
 void handleDisplayUpdate();
@@ -68,11 +108,10 @@ public:
     }
     
     static int getBarsSignal(long rssi) {
-        if (rssi > -55) return 5;
-        if (rssi > -65) return 4;
-        if (rssi > -75) return 3;
-        if (rssi > -85) return 2;
-        if (rssi > -96) return 1;
+        if (rssi > -55) return 4;
+        if (rssi > -65) return 3;
+        if (rssi > -75) return 2;
+        if (rssi > -85) return 1;
         return 0;
     }
 };
@@ -80,14 +119,17 @@ public:
 void setupOTA() {
     ArduinoOTA.setHostname(Config::HOSTNAME);
     ArduinoOTA.setPassword(Config::OTA_PASSWORD);
+    ArduinoOTA.setTimeout(30000); // 30 seconds
 
     ArduinoOTA.onStart([]() {
         IrReceiver.stop();
+        esp_task_wdt_delete(NULL);  // Unsubscribe current task from watchdog
         Serial.println("Starting OTA update");
     });
 
     ArduinoOTA.onEnd([]() {
         IrReceiver.start();
+        esp_task_wdt_add(NULL);  // Resubscribe the task to the watchdog
         Serial.println("\nOTA update completed");
     });
 
@@ -97,6 +139,7 @@ void setupOTA() {
 
     ArduinoOTA.onError([](ota_error_t error) {
         IrReceiver.start();
+        esp_task_wdt_add(NULL);  // Resubscribe the task to the watchdog
         Serial.printf("Error[%u]: ", error);
         const char* errorMsg = "Unknown Error";
         switch (error) {
@@ -117,23 +160,33 @@ void messageReceived(String &topic, String &payload) {
         int tempVolume = payload.toInt();
         if (tempVolume >= 0 && tempVolume <= 255) {
             state.volume = static_cast<byte>(tempVolume);
-            state.resetScreen();
-            updateVolume();
-            requestDisplayUpdate();
-            sendVolumeMQTT();
+            handleVolumeChange();
         }
+    }
+    else if (topic == Config::TOPIC_MOODE_SOURCE) {
+        state.moodeSource = payload;
+        requestDisplayUpdate();
+    }
+    else if (topic == Config::TOPIC_MOODE_DETAILS) {
+        state.moodeDetails = payload;
+        requestDisplayUpdate();
     }
     else if (topic == Config::TOPIC_DISPLAY_SET) {
         state.displayText = payload;
-        state.hasDisplayMessage = !payload.isEmpty();
-        if (state.hasDisplayMessage) {
-            state.currentMode = State::DisplayMode::TEXT;
-            requestDisplayUpdate();
-        } else {
-            state.currentMode = State::DisplayMode::MINIMAL;
-            requestDisplayUpdate();
-        }
+        requestDisplayUpdate();
     }
+    else if (topic == Config::TOPIC_SOURCE_SET) {
+        state.currentSource = state.stringToInputSource(payload);
+        requestDisplayUpdate();
+    }
+}
+
+void handleVolumeChange() {
+    updateVolume();
+    state.resetScreen();
+    state.currentMode = State::DisplayMode::VOLUME;
+    requestDisplayUpdate();
+    sendVolumeMQTT();
 }
 
 void setupMQTT() {
@@ -147,6 +200,9 @@ void setupMQTT() {
     
     mqttClient.subscribe(Config::TOPIC_DISPLAY_SET);
     mqttClient.subscribe(Config::TOPIC_VOLUME_SET);
+    mqttClient.subscribe(Config::TOPIC_MOODE_SOURCE);
+    mqttClient.subscribe(Config::TOPIC_MOODE_DETAILS);
+    mqttClient.subscribe(Config::TOPIC_SOURCE_SET);
 }
 
 void handleMQTT() {
@@ -165,8 +221,18 @@ void sendVolumeMQTT() {
     mqttClient.publish(Config::TOPIC_VOLUME_STATE, String(state.volume));
 }
 
+uint8_t convertVolumeToDac(uint8_t volume) {
+    // Invert the volume percentage
+    uint8_t invertedVolume = Config::VOLUME_STEPS - volume;
+
+    float db = Config::MIN_DB + (static_cast<float>(invertedVolume) / Config::VOLUME_STEPS) * 
+               (Config::MAX_DB - Config::MIN_DB);
+    float linear = pow(Config::TWICE_LOUD_DB, db / Config::TWICE_LOUD_STEPS);
+    return static_cast<uint8_t>(linear * 255.0f + 0.5f);
+}
+
 void updateVolume() {
-    int dacValue = min(255, static_cast<int>(Config::TWICE_LOUD_STEPS / Config::TWICE_LOUD_DB * state.volume + 0.5f));
+    uint8_t dacValue = convertVolumeToDac(state.volume);
     dacVolume.analogWrite(0, dacValue);
     Serial.printf("Volume: %d, DAC Value: %d\n", state.volume, dacValue);
     state.currentMode = State::DisplayMode::VOLUME;
@@ -206,10 +272,7 @@ void handleIRCommand() {
     }
 
     if (volumeChanged) {
-        state.resetScreen();
-        updateVolume();
-        requestDisplayUpdate();
-        sendVolumeMQTT();
+        handleVolumeChange();
     }
 
     IrReceiver.resume();
@@ -219,22 +282,27 @@ void requestDisplayUpdate() {
     state.displayUpdatePending = true;
 }
 
+// Helper function for text centering and truncation
+void drawCenteredText(const String& text, uint8_t y, const uint8_t* font) {
+    u8g2.setFont(font);
+    String displayText = text;
+    // Remove whitespaces
+    displayText.trim();
+    if (displayText.length() > Config::MAX_LINE_LENGTH) {
+        displayText = displayText.substring(0, Config::MAX_LINE_LENGTH);
+    }
+    uint8_t width = u8g2.getStrWidth(displayText.c_str());
+    uint8_t x = (u8g2.getDisplayWidth() - width) / 2;  // was 256
+    u8g2.drawStr(x, y, displayText.c_str());
+}
+
+void drawMinimalDisplay() {
+    drawCenteredText(state.inputSourceToString(), 42, u8g2_font_logisoso42_tf);
+}
+
 void handleDisplayUpdate() {
-    static uint8_t errorCount = 0;
-    if (state.displayBusy) {
-        errorCount++;
-        if (errorCount > 10) {  // If display stays busy for too long
-            state.displayBusy = false;
-            errorCount = 0;
-        }
-        return;
-    }
-    
-    if (!state.displayUpdatePending) {
-        return;
-    }
-    
-    errorCount = 0;
+    if (!state.displayUpdatePending || state.displayBusy) return;
+
     state.displayBusy = true;
     
     u8g2.clearBuffer();
@@ -243,29 +311,55 @@ void handleDisplayUpdate() {
     switch (state.currentMode) {
         case State::DisplayMode::VOLUME:
             u8g2.setFont(u8g2_font_logisoso18_tf);
-            u8g2.drawStr(0, 18, "VOL");
+            u8g2.drawStr(0, 18, "VOLUME:");
             
-            u8g2.setFont(u8g2_font_logisoso58_tf);
-            sprintf(buffer, "-%2d", state.volume);
-            u8g2.drawStr(0, 61, buffer);
-            u8g2.drawStr(130, 61, "dB");
+            if (state.volume < 100) {
+                sprintf(buffer, "%2d", state.volume);
+            } else {
+                sprintf(buffer, "%3d", state.volume);
+            }
+            drawCenteredText(buffer, 42, u8g2_font_logisoso42_tf);
             break;
-            
+
         case State::DisplayMode::MINIMAL:
-            u8g2.setFont(u8g2_font_logisoso18_tf);
-            sprintf(buffer, "VOL -%2d dB", state.volume);
-            u8g2.drawStr(0, 18, buffer);
+            drawMinimalDisplay();
             break;
             
         case State::DisplayMode::TEXT:
             u8g2.setFont(u8g2_font_logisoso18_tf);
             u8g2.drawStr(0, 32, state.displayText.c_str());
             break;
+
+        case State::DisplayMode::MOODE:
+            if (state.currentSource == State::InputSource::I2S) {
+                const uint8_t* font = u8g2_font_logisoso16_tf;
+                if (!state.moodeDetails.isEmpty() && !state.moodeSource.isEmpty()) {
+                    // Two lines of Moode info
+                    drawCenteredText(state.moodeDetails, 18, font);
+                    drawCenteredText(state.moodeSource, 44, font);
+                } else if (!state.moodeSource.isEmpty()) {
+                    // Single line in middle
+                    drawCenteredText(state.moodeSource, 44, font);  // 32
+                } else {
+                    drawMinimalDisplay();
+                }
+            } else {
+                drawMinimalDisplay();
+            }
+            break;
     }
-    
+
+    // Draw Volume bar when no VOLUME mode
+    if (state.currentMode != State::DisplayMode::VOLUME) {
+        u8g2.setFont(u8g2_font_t0_12_tf);
+        u8g2.drawStr(48, 63, "VOLUME:"); // 32
+        u8g2.drawFrame(93, 55, 100, 8);  // 77
+        u8g2.drawBox(93, 56, (state.volume * 100) / 100, 6);
+    }
+
     // Always draw WiFi bars
     for (int b = 0; b <= state.wifiSignalBars; b++) {
-        u8g2.drawBox(228 + (b*5), 64 - (b*5), 3, b*5);
+        u8g2.drawBox(242 + (b*3), 64 - (b*3), 2, b*3);
     }
     
     u8g2.sendBuffer();
@@ -279,11 +373,6 @@ void setup() {
     Serial.println("Booting ESP32 DAC Controller");
 
     // Initialize watchdog
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = 8000,              // 8 seconds
-        .idle_core_mask = (1 << 0),      // Watch core 0
-        .trigger_panic = true            // Trigger panic on timeout
-    };
     esp_task_wdt_init(&wdt_config);
     esp_task_wdt_add(NULL);
 
@@ -321,8 +410,18 @@ void loop() {
 
     if ((millis() - state.screenTimeOn > Config::SCREEN_TIMEOUT) && state.screenOn) {
         state.screenOn = false;
-        state.currentMode = state.hasDisplayMessage ? State::DisplayMode::TEXT : State::DisplayMode::MINIMAL;
+        state.currentMode = state.hasMoodeInfo() 
+            ? State::DisplayMode::MOODE 
+            : state.hasDisplayMessage() 
+                ? State::DisplayMode::TEXT 
+                : State::DisplayMode::MINIMAL;
         requestDisplayUpdate();
+    } else if (!state.screenOn) {
+        state.currentMode = state.hasMoodeInfo() 
+            ? State::DisplayMode::MOODE 
+            : state.hasDisplayMessage() 
+                ? State::DisplayMode::TEXT 
+                : State::DisplayMode::MINIMAL;
     }
 
     handleDisplayUpdate();
