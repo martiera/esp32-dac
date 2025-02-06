@@ -292,7 +292,7 @@ void drawCenteredText(const String& text, uint8_t y, const uint8_t* font) {
         displayText = displayText.substring(0, Config::MAX_LINE_LENGTH);
     }
     uint8_t width = u8g2.getStrWidth(displayText.c_str());
-    uint8_t x = (u8g2.getDisplayWidth() - width) / 2;  // was 256
+    uint8_t x = max((u8g2.getDisplayWidth() - width) / 2, 0);
     u8g2.drawStr(x, y, displayText.c_str());
 }
 
