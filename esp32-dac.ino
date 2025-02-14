@@ -282,16 +282,23 @@ void requestDisplayUpdate() {
     state.displayUpdatePending = true;
 }
 
+String cutTextToFitOnDisplay(const String& text) {
+    String displayText = text;
+    displayText.trim();
+    int displayWidth = u8g2.getDisplayWidth();
+
+    while (u8g2.getUTF8Width(displayText.c_str()) > displayWidth) {
+        displayText = displayText.substring(0, displayText.length() - 1);
+    }
+
+    return displayText;
+}
+
 // Helper function for text centering and truncation
 void drawCenteredText(const String& text, uint8_t y, const uint8_t* font) {
     u8g2.setFont(font);
-    String displayText = text;
-    // Remove whitespaces
-    displayText.trim();
-    if (displayText.length() > Config::MAX_LINE_LENGTH) {
-        displayText = displayText.substring(0, Config::MAX_LINE_LENGTH);
-    }
-    uint8_t width = u8g2.getStrWidth(displayText.c_str());
+    String displayText = cutTextToFitOnDisplay(text);
+    int width = u8g2.getUTF8Width(displayText.c_str());
     uint8_t x = max((u8g2.getDisplayWidth() - width) / 2, 0);
     u8g2.drawStr(x, y, displayText.c_str());
 }
